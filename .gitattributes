@@ -1,0 +1,4 @@
+# Keep these byte-exact (no line-ending normalisation): SparkRing's NCCL patch adds lines with CRLF endings, as
+# upstream, and its sha256 is checked; every overlay file is sha-checked before it is mounted.
+nccl/nccl-2.30.7-dual-pci-domain.patch -text
+overlays/** -text

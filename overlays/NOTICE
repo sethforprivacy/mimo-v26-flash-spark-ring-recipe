@@ -1,0 +1,54 @@
+vLLM file overlays for the MiMo-V2.6-Flash four-Spark recipe
+============================================================
+
+These directories are bind-mounted read-only over the vLLM package of the image
+myllmbox/mimo-v26-flash-cluster-vllm:v2 (image ID sha256:a09549748e0b42d5d89608888b55a826ead04a2d7a7b5318c47dcf8ea0593ace;
+vLLM nightly ddd6fbca plus myllmbox's changes) by launcher/vllm-rank.sh, after `sha256sum -c` of each directory's
+SHA256SUMS. Each listed path is relative to the vllm package (/usr/local/lib/python3.12/dist-packages/vllm/).
+They are identical to the overlays in production on our ring on 2026-10-01, apart from one comment line in
+vllm-patches-attn2 (a reference to a private repository removed); do not edit them without
+regenerating SHA256SUMS, and rebuild them from the new image's copies if you change the image.
+
+Origin and licence
+------------------
+Every .py file below, except vllm-patches-roce/distributed/device_communicators/mimo_roce_rd.py, is a MODIFIED COPY
+of a file from the vLLM project (https://github.com/vllm-project/vllm), taken from the image named above. vLLM is
+licensed under the Apache License, Version 2.0 ("Copyright contributors to the vLLM project"); the copies keep their
+SPDX headers. Our modifications (2026-09-29 to 2026-10-01) are licensed under Apache-2.0 as well (text: ../LICENSES/Apache-2.0.txt).
+
+  vllm-patches/          model_executor/models/mimo_v2_omni.py
+                         Port of vllm-project/vllm#58235 (open at the time; single commit 3650a535): the MiMo ViT
+                         window-attention sink as a null softmax logit instead of a bias on key 0.
+                         vllm-58235.diff = the upstream pull request's diff (reference only, not mounted).
+
+  vllm-patches-tools/    parser/mimo.py (new upstream file), parser/engine/registered_adapters.py,
+                         reasoning/__init__.py, reasoning/mimo_engine_reasoning_parser.py,
+                         tool_parsers/__init__.py, tool_parsers/mimo_tool_parser.py
+                         Port of vllm-project/vllm#58019 (merged 2026-09-29 as dfc8e0f3): the `mimo` tool parser
+                         keeps string arguments verbatim. Difference from upstream: no xgrammar structural tag
+                         (structural_tag_model = None), because the image ships xgrammar 0.2.7 and upstream's tag
+                         needs 0.2.8. vllm-58019.diff = the upstream pull request's diff (reference only).
+
+  vllm-patches-attn2/    v1/attention/ops/triton_unified_attention_diffkv.py,
+                         v1/attention/backends/triton_attn_diffkv.py
+                         Our GB10 (sm_121) launch tuning of the Triton DiffKV attention (per-layer-type tiles,
+                         split-KV verify, 2D sliding-window verify) and a Q.K^T split (192 = 128 + 64, no pad to
+                         256). Env switches: MIMO_DIFFKV_TUNE=0 (stock launch), MIMO_DIFFKV_QK_SPLIT=0,
+                         MIMO_DIFFKV_PF_FULL / _PF_SWA / _DEC_FULL / _DEC_SWA / _SEGS. Related upstream work:
+                         vllm-project/vllm#58177, #59085, #58141.
+
+  vllm-patches-fp8cfg/   model_executor/layers/quantization/utils/configs/N=*,K=4096,device_name=NVIDIA_GB10,...json
+                         Four block-FP8 GEMM kernel configs (data) generated on GB10 with vLLM's own tuner
+                         (benchmarks/kernels/benchmark_w8a8_block_fp8.py, see kernel-tuning/).
+
+  vllm-patches-roce/     distributed/device_communicators/cuda_communicator.py (modified copy: a hook that routes
+                         eligible TP all-reduces to mimo_roce_rd, a health check before eager all-gathers, cleanup)
+                         distributed/device_communicators/mimo_roce_rd.py (NEW FILE, ours, Apache-2.0): ring-only
+                         recursive doubling built from two 2-rank RoCEnante runtimes.
+                         roce-rd.diff = our diff of cuda_communicator.py against the image's copy (reference only).
+                         Needs b12x (https://github.com/local-inference-lab/b12x, Apache-2.0, commit
+                         e4084d2eef4932e0fa06db3f7a94deb83ad132d7), which is NOT included here; the launcher mounts a
+                         checkout read-only (B12X=<short sha>). The HCA pairing in mimo_roce_rd.py is hardcoded for a
+                         ring cabled 0-1-2-3-0 with each node's port 0 to the next node's port 1.
+
+The .diff files are documentation; only the paths listed in each SHA256SUMS are mounted.
