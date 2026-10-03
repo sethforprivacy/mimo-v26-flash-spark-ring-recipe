@@ -98,8 +98,7 @@ context depth.
 
 ## Long context: bf16 KV vs FP8 KV (2026-10-03)
 
-**Why.** Long agent sessions on this stack run at 250K-1M tokens, with most of each prompt cached between turns, so
-decode time dominates. At those depths a decode step is dominated by reading the 9 full-attention layers' KV cache:
+**Why.** At 250K-1M tokens of context, a decode step is dominated by reading the 9 full-attention layers' KV cache:
 - at ~500K, those reads take 9.7 ms of a 39.6 ms step, against 0.7 ms at 2K (torch profiler, C1, rank 0);
 - the bf16 reads already run at ~270 GB/s, GB10's memory-bandwidth roof.
 
@@ -435,8 +434,8 @@ Each item was measured after a clean reboot, against the then-current profile.
 
 - 2026-09-30:
   - **CPU pinning** to the ten X925 cores (`CPUSET=5-9,15-19`): noise-level (single stream −3 %, C16 +5 %).
-  - **MTP K=2** (`SPEC_K=2`): prose and C32 +11 %, but code −10 % and structured −12 %. K=3 stays for a code-heavy
-    agent workload.
+  - **MTP K=2** (`SPEC_K=2`): prose and C32 +11 %, but code −10 % and structured −12 %. K=3 stays for code-heavy
+    output.
   - **`--max-num-batched-tokens 32768`:** the memory guard tripped on all four ranks at boot, with 0.8-1.5 GiB free
     while FlashInfer autotuned the new token buckets.
   - **FlashInfer CUTLASS MXFP4×MXFP8 MoE** (`--moe-backend flashinfer_cutlass`): decode −3 to −9 %, no prefill gain.
@@ -524,8 +523,7 @@ Keep the previous profile file next to the live one; that is the whole rollback 
   - Larger batched-token budgets did not fit (see above).
 - **Measure only on freshly rebooted nodes.** GB10 unified memory fragments, which can cost a large share of
   throughput.
-- **Speculation:** MTP K=3 suits a code-heavy agent workload. Prose-heavy traffic may prefer K=2, code-only traffic
-  DFlash.
+- **Speculation:** MTP K=3 suits code-heavy output. Prose-heavy output may prefer K=2, code-only output DFlash.
 - **vllm-project/vllm#46669** (corrupted tokens with async scheduling + MTP at concurrency > 1) did not reproduce on this build:
   0 of 128 at C32. Async scheduling stays on; the garbage probe is in `bench/`.
 - **llm-inference-bench's loop guard** tripped more often on RoCEnante boots in its duration-bound cells at 64K
