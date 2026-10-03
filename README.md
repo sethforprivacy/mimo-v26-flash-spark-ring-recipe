@@ -9,14 +9,16 @@ experts, FP8 attention and 3 MTP layers; it accepts images.
 
 The stack:
 - **Engine:** vLLM from the public image `myllmbox/mimo-v26-flash-cluster-vllm:v2`, pinned by digest.
-- **Overlays:** five sets of file overlays, sha-checked and mounted read-only:
+- **Overlays:** six sets of file overlays, sha-checked and mounted read-only:
   - two upstream vLLM fixes ported to this image;
   - GB10 attention and FP8 GEMM tuning;
+  - an FP8 KV cache with its own GB10-tuned attention launch;
   - a ring-only RDMA all-reduce built on b12x's RoCEnante.
 - **Transport:** a patched NCCL 2.30.7 that uses both PCIe functions of every link.
 
-It is the production profile we have served since 2026-10-01, with the benchmark and microbenchmark scripts
-behind every number below. Every number was measured on our own cluster.
+It is the production profile we have served since 2026-10-03 (FP8 KV cache), with the benchmark and microbenchmark
+scripts behind every number below. A bf16-KV alternative is kept: `launcher/profile.bf16-20261001.env`, the previous
+production profile. Every number was measured on our own cluster.
 
 **Status:** a research-grade recipe from one cluster. **Licence:** MIT for our own files; third-party pieces keep
 their own licences (see [Licence](#licence)).
@@ -24,6 +26,7 @@ their own licences (see [Licence](#licence)).
 ## Contents
 
 - [Results: launch day vs today](#results-launch-day-2026-09-29-vs-today-2026-10-01)
+- [Long context: bf16 KV vs FP8 KV](#long-context-bf16-kv-vs-fp8-kv-2026-10-03)
 - [Hardware and cabling](#hardware-and-cabling)
 - [Software pins](#software-pins)
 - [Bring-up](#bring-up)
@@ -39,7 +42,8 @@ their own licences (see [Licence](#licence)).
 
 The hardware, cables, checkpoint and image are the same in both columns; only the profile and the overlays differ.
 "Launch" is the 2026-09-29 profile (`launcher/profile.launch-20260929.env`). "Today" is the 2026-10-01 production
-profile (`launcher/profile.env`).
+profile, with a bf16 KV cache (`launcher/profile.bf16-20261001.env`). The FP8-KV profile that replaced it on
+2026-10-03 (`launcher/profile.env`) is compared at long context in the next section.
 
 | | launch | today | change |
 |---|---:|---:|---:|
@@ -91,6 +95,66 @@ cold prefill at 250K read 2,365 tok/s without it and 2,379 with it.
 The decode step itself (torch profiler, C1, rank 0) went from 34.1 to 30.7 ms at 2K context and from 35.1 to
 31.3 ms at 60K. That change is RoCEnante alone; the attention tuning had already removed most of the slowdown with
 context depth.
+
+## Long context: bf16 KV vs FP8 KV (2026-10-03)
+
+**Why.** Long agent sessions on this stack run at 250K-1M tokens, with most of each prompt cached between turns, so
+decode time dominates. At those depths a decode step is dominated by reading the 9 full-attention layers' KV cache:
+- at ~500K, those reads take 9.7 ms of a 39.6 ms step, against 0.7 ms at 2K (torch profiler, C1, rank 0);
+- the bf16 reads already run at ~270 GB/s, GB10's memory-bandwidth roof.
+
+So the remaining lever is fewer bytes: an FP8 KV cache.
+
+**The FP8 kernel first had to be retuned.** With the bf16-tuned launch, the FP8 cache (`vllm-patches-fp8kv`) reached
+only 1.17-1.19x on half the bytes (~177 GB/s). A launch sweep on one GB10 (`kernel-tuning/attn_fp8_dec_sweep.py`;
+outputs within 2e-5) found:
+- **spec-verify:** 64:32:4:2 with 128 split-KV segments, 1.59 / 1.64 / 1.68x vs bf16 at 250K / 500K / 1M, and 2.09x
+  for two 500K sequences;
+- **prefill tail:** 128:128:8:2, 0.91x of bf16 (0.83x before). The 128-token tile only fits in shared memory with
+  FP8.
+
+The same sweep on the bf16 launch (`kernel-tuning/attn_bf16_dec_sweep.py`) found no gain: 0.99-1.03x at one
+sequence.
+
+**Serving, one session.** Each run: a cold prompt, then two hot ~1.3K-token turns. Engine step from the engine's own
+counters; each profile on a fresh boot.
+
+| context | engine step, bf16 → FP8 | hot-turn TTFT, bf16 → FP8 | cold prefill, bf16 → FP8 |
+|---|---:|---:|---:|
+| ~248K | 35.2-36.1 → 34.1 ms (−4 %) | 1.65-1.8 → 1.87-1.89 s | 104 → 110 s |
+| ~494K | 40.5-40.8 → 36.1-36.9 ms (−10 %) | 2.9-3.5 → 3.37 s | 298 → 321 s |
+| ~933K | 49.6-50.8 → 42.0-42.1 ms (**−16 %**) | 5.1-5.5 → 5.4-6.0 s | 854 → 943 s |
+
+- **Per turn:** for a turn generating ~770 tokens, about −2.5 / −7 / −10 %.
+- **Capacity:** the KV pool doubles to 7,927,271 tokens.
+
+**Quality.**
+
+| | FP8 | bf16 |
+|---|---|---|
+| Corpus NLL | 1.8327 | 1.8281-1.8309 (several boots) |
+| Needle at 1,007,259 tokens | exact, 1,125 s | exact, 977 s |
+
+On FP8, also:
+- needles exact at 287K and at ~500K (10 / 50 / 90 % depth);
+- concurrent 2 × ~247K and 4 × ~123K needles all exact;
+- agent loop 12/12 with no duplicate tool calls, and 0 of 64 garbage-probe responses flagged.
+
+**Two concurrent sessions** (FP8 profile):
+
+| context | engine step | aggregate vs one session | per-session decode | hot-turn TTFT |
+|---|---:|---:|---:|---:|
+| ~248K | 51 ms | ~1.4x | 47-54 tok/s | 2.5 s |
+| ~494K | 56-61 ms | ~1.3x | 40-43 tok/s | 4.3-4.4 s (mean) |
+
+The second session mostly adds MoE expert reads (more distinct experts per step), not attention.
+
+**At short context FP8 is neutral to slightly negative.** On 2026-10-01, with the earlier launch:
+- RigMark single stream read 119.6 / 73.3 / 127.5 tok/s (code / prose / structured), against 122.2 / 71.1 / 128.1
+  on bf16;
+- cold prefill was 3-8 % slower.
+
+For short contexts, or where exact bf16 KV numerics matter, use `launcher/profile.bf16-20261001.env`.
 
 ## Hardware and cabling
 
@@ -234,13 +298,13 @@ mimo`. Generation defaults are T=1.0, top_p=0.95.
 |---|---|---|
 | `PORT` | 8015 | API port on rank 0 |
 | `NCCL_DUAL` | 1 | NCCL over all four RoCE functions (both PCIe domains) with `NCCL_IB_EXTENDED_IPV4_GIDS=1 NCCL_IB_PRESERVE_PCI_DOMAIN=1` |
-| `VLLM_EXTRA` | `--linear-backend=triton,--max-num-batched-tokens=16384` | CUTLASS FP8 linear rejects the per-rank (4096, 3392) QKV shape at TP4; 16K batched tokens gave +38 % / +20 % prefill at 8K / 64K, with decode unchanged |
-| `KV_BYTES` | 30000000000 | KV cache per rank; pool 3,963,635 tokens (3.78 × 1M) |
+| `VLLM_EXTRA` | `--linear-backend=triton,--max-num-batched-tokens=16384,--kv-cache-dtype=fp8` | CUTLASS FP8 linear rejects the per-rank (4096, 3392) QKV shape at TP4; 16K batched tokens gave +38 % / +20 % prefill at 8K / 64K, with decode unchanged; FP8 KV cache (per-tensor scale 1.0) |
+| `KV_BYTES` | 30000000000 | KV cache per rank; pool 7,927,271 tokens with FP8 KV (7.56 × 1M; bf16: 3,963,635) |
 | `MAX_LEN` / `MAX_SEQS` | 1048576 / 64 | 1M context; 64 seats (aggregate keeps scaling past C32) |
 | `MBX_MTP_NONCHAIN` | 1 | each of the 3 MTP layers reads the target model's hidden states |
-| `VLLM_PATCHES` + `VLLM_PATCHES_EXTRA` | `vllm-patches` + `attn2,fp8cfg,tools,roce` | the overlays below, sha-checked and mounted read-only |
+| `VLLM_PATCHES` + `VLLM_PATCHES_EXTRA` | `vllm-patches` + `fp8kv,fp8cfg,tools,roce` | the overlays below, sha-checked and mounted read-only (`fp8kv` replaces `attn2`) |
 | `B12X` | e4084d2e | the b12x checkout `vllm-patches-roce` needs |
-| `VLLM_ENV` | `NCCL_MIN_NCHANNELS=4,NCCL_MAX_NCHANNELS=4,MIMO_ROCE_RD=1,MIMO_ROCE_RD_MAX=1048576` | NCCL 4 channels; TP all-reduces ≤ 1 MB on RoCEnante recursive doubling |
+| `VLLM_ENV` | `NCCL_MIN_NCHANNELS=4,NCCL_MAX_NCHANNELS=4,MIMO_ROCE_RD=1,MIMO_ROCE_RD_MAX=1048576,MIMO_DIFFKV_DEC_FULL=64:32:4:2,MIMO_DIFFKV_SEGS=128:16:4,MIMO_DIFFKV_PF_FULL=128:128:8:2` | NCCL 4 channels; TP all-reduces ≤ 1 MB on RoCEnante recursive doubling; the FP8-tuned attention launch (never use `PF_FULL=128:128:...` with a bf16 cache: the tile only fits shared memory with FP8) |
 
 **Fixed in `vllm-rank.sh`:**
 - Engine: TP4 over `--nnodes 4`, MTP K=3 (`--speculative-config {"method":"mtp","num_speculative_tokens":3}`),
@@ -339,6 +403,25 @@ be added the same way (`SPEC_K`, `MOE_BACKEND`, `GMU`, `CPUSET`, `VLLM_CC`, ...)
 - The overlay also adds a health check before every eager logits all-gather, so a poisoned runtime raises like an
   NCCL timeout.
 
+**`vllm-patches-fp8kv`: FP8 KV cache for the DiffKV attention (ported 2026-10-01, production since 2026-10-03).**
+- A port of vllm-project/vllm#58128 onto the tuned `attn2` kernel, so it **replaces** `vllm-patches-attn2`:
+  - MiMo's decoder and MTP layers forward `cache_config`, so `--kv-cache-dtype fp8` takes effect; on stock vLLM it
+    is silently ignored;
+  - the DiffKV backend and kernel accept FP8 K/V with per-tensor descales; the checkpoint carries no KV scales, so
+    they are 1.0.
+- Difference from upstream: both dots run in fp16 (Q cast once; fp8 → fp16 is one conversion per pair). Upcasting FP8
+  tiles to bf16 made prefill attention 1.8x slower on GB10 (Triton 3.7.1); fp16 dots cut that to 0.83-0.86x.
+- The FP8 path needs its own launch, set through `VLLM_ENV`:
+  - `MIMO_DIFFKV_DEC_FULL=64:32:4:2` and `MIMO_DIFFKV_SEGS=128:16:4` take spec-verify from 1.17-1.19x to
+    1.59-1.68x of bf16;
+  - `MIMO_DIFFKV_PF_FULL=128:128:8:2` takes the prefill tail from 0.83x to 0.91x;
+  - segment counts must be powers of two.
+
+  See [Long context](#long-context-bf16-kv-vs-fp8-kv-2026-10-03) for the serving numbers.
+- The kernel test `kernel-tuning/attn_fp8kv_test.py`:
+  - the FP8 path matches the bf16 kernel run on the dequantized cache to ≤ 0.00098;
+  - the FP8 quantization itself is ~3 % relative.
+
 **Not overlays, also part of today's profile:**
 - **NCCL 4 channels.** NCCL's own channel choice was 2.7-5.3x too slow at 512 KB-1 MB, exactly the verify
   all-reduce size at C16-C32. Pinning 4 channels gave C32 sampled prose 302 to 414 tok/s (+37 %) and short-code C16
@@ -365,7 +448,7 @@ Each item was measured after a clean reboot, against the then-current profile.
     others were not viable here or lacked multi-node TP. SparkRing's MiMo profile was not run: its RoCEnante path
     needs ConnectX forwarding (host changes) on a switchless ring.
 - 2026-10-01:
-  - **Eager TP all-reduce between PIECEWISE graphs** (a minimal port of open vllm#48877): shorter NCCL kernels, but
+  - **Eager TP all-reduce between PIECEWISE graphs** (a minimal port of open vllm-project/vllm#48877): shorter NCCL kernels, but
     launch gaps raised GPU idle from 4.9 to 7.2 %. No gain.
   - **A capture-only NCCL communicator (`graphUsageMode=1`):** +1-2 %, superseded by RoCEnante.
   - **Dynamic MTP depth** (`num_speculative_tokens_per_batch_size`): only C32 prose gained (+4 %), short-code C16
@@ -374,15 +457,25 @@ Each item was measured after a clean reboot, against the then-current profile.
     a slower agent loop.
   - **Column-parallel MTP `eh_proj`:** the GEMM saving was eaten by graph-captured all-gathers.
   - **Marlin FP8 W8A16 for the block-FP8 layers:** decode step −1.6-1.8 % but prefill 3-4 % slower. Net within noise.
-  - **FP8 KV cache** (vllm#58128 ported onto our kernel): held as an option, see the caveats.
+  - **FP8 KV cache** (vllm-project/vllm#58128 ported onto our kernel): held on 2026-10-01 for short contexts; adopted
+    on 2026-10-03 with its own launch tuning (see [Long context](#long-context-bf16-kv-vs-fp8-kv-2026-10-03)).
   - **128 seats:** still scales (C128 sampled prose ~815 tok/s, short code ~1,400) but not adopted, because the KV
     pool still caps long-context concurrency.
+
+- 2026-10-03:
+  - **bf16 attention launch re-tune at long context:** no gain. The production launch already reads KV at 240-255
+    GB/s for one sequence; the best alternative was 0.99-1.03x, and only two concurrent 500K sequences gained
+    (1.17x).
+  - **Calibrated FP8 KV scales:** `--calculate-kv-scales` does not exist in this image's vLLM, so the scales stay 1.0.
+  - **The 7-token DFlash drafter at long context:** not run. Its per-step cost on 2026-10-01 (43.5 vs 32 ms at ~77K)
+    is drafter and verify compute, which does not shrink at long context, so MTP K=3 stays ahead.
 
 ## Rollback
 
 Every rollback is the same sequence: `launcher/ring-up.sh down`, reboot all four nodes, then
 `PROFILE=<profile> launcher/ring-up.sh up`.
 
+- **bf16 KV cache:** `launcher/profile.bf16-20261001.env`, the production profile of 2026-10-01 to 2026-10-03.
 - **Without RoCEnante:** `launcher/profile.rollback-20260930.env`, the production profile of 2026-09-30 to
   2026-10-01, with every all-reduce on NCCL. Changing `MIMO_ROCE_RD=1` to `MIMO_ROCE_RD=0` in `VLLM_ENV` does the
   same with the overlay still mounted.
@@ -412,23 +505,28 @@ Keep the previous profile file next to the live one; that is the whole rollback 
 - **The image's loader is closed source** (myllmbox's `libmbx_loader.so`, `--load-format mbx`). The myllmbox recipe
   repository carried no licence file when we checked; we use their public image and none of their files.
 - **Tool calls:** strict `tool_choice` does not get a grammar (xgrammar 0.2.7 in the image).
-- **FP8 KV is held as a capacity option, not shipped here** (`--kv-cache-dtype fp8` with our port of vllm#58128).
-  - It doubles the pool to 7.93M tokens and fits C32 at 128K, with needles exact to ~500K.
-  - It costs 3-8 % prefill and +0.003 NLL.
-  - It is worth it only when the KV pool binds.
+- **FP8 KV is the default since 2026-10-03.**
+  - It doubles the pool to 7.93M tokens and decodes faster at long context (−10 % / −16 % engine step at ~500K /
+    ~1M), with needles exact to ~1M.
+  - The costs:
+    - +~0.003 corpus NLL;
+    - hot-turn TTFT +6-15 % and cold prefill +6-10 % at 250K-1M;
+    - roughly neutral decode at short context.
+  - Use `launcher/profile.bf16-20261001.env` where those costs matter more than long-context decode or capacity.
 - **1M context and memory:**
   - KV 30 GB per rank leaves 32-35 GiB MemAvailable per node after boot.
   - The boot transient dips to ~10.3 GiB on rank 0 and ~12.6 GiB on the others; the lowest reading while serving
     was ~22 GiB on rank 0 and ~25 GiB on the others.
   - The host memory guard stops its own rank below 4 GiB, or after three samples in a row below 6 GiB. It does not
     stop the peers; run `ring-up.sh down` after a trip.
-  - The 3.96M-token pool holds 3.78 concurrent 1M-token requests. Many long sessions at once will queue.
+  - The 7.93M-token pool (FP8 KV) holds 7.56 concurrent 1M-token requests (bf16: 3.96M, 3.78). Many long sessions
+    at once will queue, and each extra concurrent session slows the others (see the two-session table above).
   - Larger batched-token budgets did not fit (see above).
 - **Measure only on freshly rebooted nodes.** GB10 unified memory fragments, which can cost a large share of
   throughput.
 - **Speculation:** MTP K=3 suits a code-heavy agent workload. Prose-heavy traffic may prefer K=2, code-only traffic
   DFlash.
-- **vllm#46669** (corrupted tokens with async scheduling + MTP at concurrency > 1) did not reproduce on this build:
+- **vllm-project/vllm#46669** (corrupted tokens with async scheduling + MTP at concurrency > 1) did not reproduce on this build:
   0 of 128 at C32. Async scheduling stays on; the garbage probe is in `bench/`.
 - **llm-inference-bench's loop guard** tripped more often on RoCEnante boots in its duration-bound cells at 64K
   context: 8 of 25 cells vs 1 of 17 on NCCL boots.
@@ -457,6 +555,9 @@ bench/lib-bench.sh today $KEYS                                 # llm-inference-b
 # "launch" column: boot launcher/profile.launch-20260929.env after a reboot, then the same with the defaults
 taskset -c 0-4,10-14 bench/ab-suite.sh launch $URL mimo-v2.6-flash $KEYS gates,agent,decode,ladder,longctx,garbage,prefill
 python3 bench/compare-arms.py $HOME/mimo26-bench               # one table across arms
+# long context (2026-10-03): one or two sessions, cold ~prefix then two hot turns; ~0.84 tokens per target unit,
+# so LONG_PREFIX 300000 / 600000 / 1135000 give ~250K / ~500K / ~950K
+LONG_CONC=1 LONG_ROTATE=1 LONG_PREFIX=600000 taskset -c 0-4,10-14 bench/ab-suite.sh lc500k $URL mimo-v2.6-flash $KEYS longctx
 ```
 
 | table row | script / cell |
@@ -473,6 +574,8 @@ python3 bench/compare-arms.py $HOME/mimo26-bench               # one table acros
 | NLL | cell `ppl` with `PPL_FILES=<your corpus>`, then `ppl-probe.py compare` |
 | loop rate at equal length | `bench/loop-probe.py` |
 | tool-parser bug and fix | `bench/tools-unit.sh` |
+| long-context step / TTFT | cell `longctx` with `LONG_CONC` and `LONG_PREFIX` (see above) |
+| FP8 / bf16 attention launch sweeps | `kernel-tuning/attn_fp8_dec_sweep.py`, `kernel-tuning/attn_bf16_dec_sweep.py` (one GPU, `stable_timer.py`) |
 | collectives, kernels | `kernel-tuning/` (see its README) |
 
 ## Layout
@@ -480,9 +583,11 @@ python3 bench/compare-arms.py $HOME/mimo26-bench               # one table acros
 ```
 README.md  LICENSE (MIT)  LICENSES/Apache-2.0.txt  .gitattributes (keeps the patch and overlays byte-exact)
 launcher/      vllm-rank.sh (one rank), ring-up.sh (owner: up/check/down/status), load-hosts.sh,
-               hosts.env.example, profile.env (production), profile.rollback-20260930.env,
-               profile.launch-20260929.env, memory-guard.py, liveness-vllm.py, fetch-checkpoint.py
-overlays/      vllm-patches  vllm-patches-attn2  vllm-patches-fp8cfg  vllm-patches-tools  vllm-patches-roce  NOTICE
+               hosts.env.example, profile.env (production, FP8 KV), profile.bf16-20261001.env,
+               profile.rollback-20260930.env, profile.launch-20260929.env, memory-guard.py, liveness-vllm.py,
+               fetch-checkpoint.py
+overlays/      vllm-patches  vllm-patches-attn2  vllm-patches-fp8kv  vllm-patches-fp8cfg  vllm-patches-tools
+               vllm-patches-roce  NOTICE
 nccl/          nccl-2.30.7-dual-pci-domain.patch + dual-pci-domain.json (SparkRing, unchanged), build-nccl.sh,
                PROVENANCE.md
 bench/         ab-suite.sh qualify.sh post-boot-check.sh lib-bench.sh tools-unit.sh + the Python probes
@@ -497,7 +602,8 @@ kernel-tuning/ attention, FP8 GEMM, NCCL and RoCEnante microbenchmarks + README
 - **vLLM project and contributors:**
   - the engine, and the files the overlays modify;
   - ported pull requests vllm-project/vllm#58019 (MiMo tool parser) and vllm-project/vllm#58235 (MiMo ViT sink);
-  - related work vllm-project/vllm#58177, vllm-project/vllm#59085, vllm-project/vllm#58141 and vllm-project/vllm#58128.
+  - the FP8 KV cache for Triton DiffKV, vllm-project/vllm#58128, which `vllm-patches-fp8kv` ports;
+  - related work vllm-project/vllm#58177, vllm-project/vllm#59085 and vllm-project/vllm#58141.
 - **local-inference-lab:** [b12x](https://github.com/local-inference-lab/b12x) and its RoCEnante RDMA collectives,
   which our recursive doubling composes; and llm-inference-bench.
 - **SparkRing ([FujitsuPolycom/sparkring](https://github.com/FujitsuPolycom/sparkring)):** the switchless-cycle and

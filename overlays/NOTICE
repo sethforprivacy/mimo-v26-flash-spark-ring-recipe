@@ -37,6 +37,16 @@ SPDX headers. Our modifications (2026-09-29 to 2026-10-01) are licensed under Ap
                          MIMO_DIFFKV_PF_FULL / _PF_SWA / _DEC_FULL / _DEC_SWA / _SEGS. Related upstream work:
                          vllm-project/vllm#58177, #59085, #58141.
 
+  vllm-patches-fp8kv/    v1/attention/ops/triton_unified_attention_diffkv.py,
+                         v1/attention/backends/triton_attn_diffkv.py,
+                         model_executor/models/mimo_v2.py, model_executor/models/mimo_v2_mtp.py
+                         FP8 KV cache: a port of vllm-project/vllm#58128 (FP8 KV for Triton DiffKV and MiMo-V2.6-Flash;
+                         open at the time) onto the vllm-patches-attn2 kernel, so it replaces vllm-patches-attn2. Our
+                         changes: both FP8-path dots in fp16 (Q cast once) instead of upcasting K/V tiles to bf16,
+                         and FP8-specific launch configs through the same env switches
+                         (MIMO_DIFFKV_DEC_FULL=64:32:4:2, MIMO_DIFFKV_SEGS=128:16:4, MIMO_DIFFKV_PF_FULL=128:128:8:2
+                         in launcher/profile.env).
+
   vllm-patches-fp8cfg/   model_executor/layers/quantization/utils/configs/N=*,K=4096,device_name=NVIDIA_GB10,...json
                          Four block-FP8 GEMM kernel configs (data) generated on GB10 with vLLM's own tuner
                          (benchmarks/kernels/benchmark_w8a8_block_fp8.py, see kernel-tuning/).
